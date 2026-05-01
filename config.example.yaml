@@ -1,0 +1,57 @@
+# HTTP代理服务器 - 多路由配置示例
+
+# 本地监听端口
+local_port: 8080
+
+# 请求超时时间（秒）
+timeout: 30
+
+# 调试模式（开启后打印请求头、query、请求体等详细信息）
+debug: false
+
+# 路由配置列表
+routes:
+  # 示例1: 用户服务路由
+  - path_pattern: "^/users/"
+    remote_url: "http://localhost:3001"
+    rules:
+      - type: "header"
+        action: "add"
+        key: "X-Service"
+        value: "user-service"
+      - type: "path"
+        action: "replace"
+        pattern: "^/users/(.*)"
+        value: "/api/users/$1"
+  
+  # 示例2: 订单服务路由
+  - path_pattern: "^/orders/"
+    remote_url: "http://localhost:3002"
+    rules:
+      - type: "header"
+        action: "add"
+        key: "X-Service"
+        value: "order-service"
+      - type: "query"
+        action: "add"
+        key: "source"
+        value: "proxy"
+  
+  # 示例3: 静态资源路由
+  - path_pattern: "^/static/"
+    remote_url: "http://localhost:8081"
+    rules:
+      - type: "header"
+        action: "add"
+        key: "X-Cache"
+        value: "static"
+  
+  # 默认路由 - 可选配置，处理所有未匹配的请求
+  # 如果不配置默认路由，未匹配的请求将返回404
+  - path_pattern: ".*"
+    remote_url: "http://localhost:3000"
+    rules:
+      - type: "header"
+        action: "add"
+        key: "X-Proxy"
+        value: "true"
