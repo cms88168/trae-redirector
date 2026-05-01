@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,11 +30,14 @@ func NewProxy(config *Config) *Proxy {
 }
 
 // createHTTPClient 创建HTTP客户端，支持代理配置
+// 注意：不设置 http.Client.Timeout，避免对流式响应（SSE/chunked）造成整体超时；
+// 仅通过 Transport.ResponseHeaderTimeout 守护“拿不到响应头”的场景。
 func createHTTPClient(timeout int, proxyConfig *ProxyConfig) (*http.Client, error) {
 	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: time.Duration(timeout) * time.Second,
 	}
 
 	// 配置代理
@@ -52,7 +57,6 @@ func createHTTPClient(timeout int, proxyConfig *ProxyConfig) (*http.Client, erro
 	}
 
 	return &http.Client{
-		Timeout:   time.Duration(timeout) * time.Second,
 		Transport: transport,
 	}, nil
 }
@@ -73,12 +77,13 @@ func (p *Proxy) Start() error {
 	log.Printf("超时设置: %d秒", p.config.Timeout)
 
 	// 创建HTTP服务器
+	// 注意：为适配流式响应（SSE/chunked），不设置 ReadTimeout/WriteTimeout；
+	// 仅通过 ReadHeaderTimeout 限制请求头读取时间。
 	server := &http.Server{
-		Addr:         addr,
-		Handler:      http.HandlerFunc(p.serveHTTP),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              addr,
+		Handler:           http.HandlerFunc(p.serveHTTP),
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// 启动服务器
@@ -371,13 +376,95 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, r *http.Request, resp *ht
 		}
 	}
 
+	streaming := isStreamingResponse(resp)
+	if streaming {
+		// 流式响应使用 chunked 编码，删除 Content-Length 避免冲突
+		w.Header().Del("Content-Length")
+	}
+
+	if p.config.Debug {
+		log.Printf("[DEBUG] ===== 响应头 =====")
+		for key, values := range resp.Header {
+			for _, value := range values {
+				log.Printf("[DEBUG]   %s: %s", key, value)
+			}
+		}
+		if streaming {
+			log.Printf("[DEBUG] 流式响应开始转发（按块 flush）")
+		}
+		log.Printf("[DEBUG] ==================")
+	}
+
 	w.WriteHeader(resp.StatusCode)
 
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	if streaming {
+		p.streamCopy(w, resp.Body, r)
+	} else if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("写入响应失败: %v", err)
 	}
 
 	log.Printf("响应完成: %s %s", r.Method, r.URL.String())
+}
+
+// isStreamingResponse 判断响应是否为流式响应
+func isStreamingResponse(resp *http.Response) bool {
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/event-stream") ||
+		strings.Contains(ct, "application/x-ndjson") ||
+		strings.Contains(ct, "application/stream+json") {
+		return true
+	}
+	for _, te := range resp.TransferEncoding {
+		if strings.EqualFold(te, "chunked") {
+			return true
+		}
+	}
+	return false
+}
+
+// streamCopy 按块转发并 flush，适配 SSE/chunked 流式响应
+func (p *Proxy) streamCopy(w http.ResponseWriter, body io.Reader, r *http.Request) {
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 4096)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				log.Printf("写入流式响应失败: %v", werr)
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if isStreamEndError(err, r) {
+				log.Printf("流式转发结束: %v", err)
+			} else {
+				log.Printf("读取上游流失败: %v", err)
+			}
+			return
+		}
+		if r.Context().Err() != nil {
+			log.Printf("客户端已断开，结束流式转发")
+			return
+		}
+	}
+}
+
+// isStreamEndError 判断是否为流式正常结束（EOF 或客户端断开导致的 context 取消）
+func isStreamEndError(err error, r *http.Request) bool {
+	if err == io.EOF {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// 请求上下文已结束，视为客户端断开导致的正常收尾
+	if r.Context().Err() != nil {
+		return true
+	}
+	return false
 }
 
 // getRetryCount 获取重试次数
