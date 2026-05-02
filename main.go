@@ -32,7 +32,7 @@ func main() {
 	// 创建代理
 	proxy := NewProxy(config)
 
-	// 优雅关闭处理
+	// 优雅关闭处理（捕获 Ctrl+C / 终止信号）
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -41,8 +41,17 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// 启动代理服务器
-	if err := proxy.Start(); err != nil {
-		log.Fatalf("代理服务器启动失败: %v", err)
-	}
+	// 代理服务器放入后台 goroutine 启动，主线程交给托盘
+	go func() {
+		if err := proxy.Start(); err != nil {
+			log.Fatalf("代理服务器启动失败: %v", err)
+		}
+	}()
+
+	// 启动系统托盘（Windows 下显示右下角图标并自动隐藏控制台）
+	// 非 Windows 平台为空实现，阻塞等待信号
+	runTray(func() {
+		log.Println("代理服务器已停止")
+		os.Exit(0)
+	})
 }
