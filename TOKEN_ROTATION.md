@@ -2,21 +2,26 @@
 
 ## 概述
 
-代理服务器现在支持路由级的Token池管理，可以配置多个Token进行轮换使用，并在认证失败时自动切换到下一个Token重试。
+代理服务器支持路由级的Token池管理，可以配置多个Token进行轮换使用，并在认证失败时自动切换到下一个Token重试。通过`origin`字段可以精确控制Token与请求的交互方式。
 
 ## 功能特性
 
 ### 1. 多Token轮换
-- 每个路由可独立配置Token池
+- 每个config可独立配置Token池
 - Token按顺序循环使用
 - 支持自定义Token头和前缀
 
-### 2. 认证失败Fallback
+### Origin策略
+- `use`：只使用来源请求中的Token，不替换（透传）
+- `add`（默认）：将来源请求的Token收集到池中管理，同时使用池中Token替换请求头
+- `ignore`：完全忽略来源请求的Token，只使用池中Token替换
+
+### 3. 认证失败Fallback
 - 自动检测401/403认证失败
 - 失败时自动切换下一个Token
 - 重试整个请求（包括所有规则处理）
 
-### 3. 线程安全
+### 4. 线程安全
 - 每个路由独立的TokenManager
 - 使用sync.Mutex保护状态
 - 支持高并发请求
@@ -27,7 +32,7 @@
 
 ```yaml
 token:
-  enabled: true              # 是否启用Token轮换
+  origin: "add"              # Token来源策略: use | add | ignore
   tokens:                    # Token列表
     - "token-1"
     - "token-2"
@@ -40,10 +45,51 @@ token:
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| enabled | bool | 是 | - | 是否启用Token轮换 |
+| origin | string | 否 | "add" | Token来源策略 |
 | tokens | []string | 是 | - | Token列表，至少一个 |
 | header | string | 否 | "Authorization" | Token请求头名称 |
 | prefix | string | 否 | "Bearer" | Token前缀，空字符串表示无前缀 |
+
+### Origin策略详解
+
+#### `use` - 透传模式
+只使用来源请求中的Token，代理不做任何替换。
+
+```yaml
+token:
+  origin: "use"
+  tokens: ["sk-seed"]
+```
+
+**行为**：请求中的Token原样透传到远程服务器，池中的Token不会被应用。
+**适用场景**：客户端自带有效Token，代理仅做转发不干预认证。
+
+#### `add` - 收集模式（默认）
+将来源请求中的Token收集到池中管理，同时使用池中Token替换请求头。
+
+```yaml
+token:
+  origin: "add"
+  tokens: ["sk-pool-1", "sk-pool-2"]
+```
+
+**行为**：
+- 请求携带了池中没有的新Token → 自动收集到池中
+- 请求头被池中当前Token替换后发送到远程
+
+**适用场景**：自动扩充Token池，同时统一管理认证。多个客户端携带不同Token，代理收集并轮换使用。
+
+#### `ignore` - 强制模式
+完全忽略来源请求中的Token，只使用池中Token替换。
+
+```yaml
+token:
+  origin: "ignore"
+  tokens: ["sk-managed-1", "sk-managed-2"]
+```
+
+**行为**：无论请求是否携带Token，都强制使用池中当前Token替换请求头。
+**适用场景**：客户端可能携带无效/过期Token，需要强制使用服务端管理的Token。
 
 ## 工作流程
 
@@ -82,20 +128,29 @@ Token池: [Token-A, Token-B, Token-C]
 
 ## 配置示例
 
-### 示例1：基本Token轮换
+### 示例1：基本Token轮换（add模式，默认）
 
 ```yaml
 routes:
   - path_pattern: "^/api/"
+    config: "api-with-token"
+
+configs:
+  - name: "api-with-token"
     remote_url: "https://api-backend.example.com"
     token:
-      enabled: true
+      origin: "add"
       tokens:
         - "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc123"
         - "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.def456"
         - "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ghi789"
       header: "Authorization"
       prefix: "Bearer"
+    rules:
+      - type: "path"
+        action: "replace"
+        pattern: "^/api/(.*)"
+        value: "/v2/$1"
 ```
 
 **效果**：
@@ -105,11 +160,11 @@ routes:
 ### 示例2：自定义Token头
 
 ```yaml
-routes:
-  - path_pattern: "^/internal/"
+configs:
+  - name: "internal-service"
     remote_url: "http://internal-service:3000"
     token:
-      enabled: true
+      origin: "ignore"
       tokens:
         - "api-key-123456"
         - "api-key-789012"
@@ -121,13 +176,50 @@ routes:
 - 请求头: `X-API-Key: api-key-123456`
 - 无前缀，直接传递Token值
 
-### 示例3：不使用Token
+### 示例3：use模式（透传）
 
 ```yaml
-routes:
-  - path_pattern: "^/public/"
+configs:
+  - name: "passthrough"
+    remote_url: "https://api.example.com"
+    token:
+      origin: "use"
+      tokens:
+        - "seed-token"
+      header: "Authorization"
+      prefix: "Bearer"
+```
+
+**效果**：
+- 请求中的Token原样透传
+- 池中Token不会被应用到请求头
+
+### 示例4：ignore模式（强制使用池Token）
+
+```yaml
+configs:
+  - name: "managed-auth"
+    remote_url: "https://api.example.com"
+    token:
+      origin: "ignore"
+      tokens:
+        - "managed-key-1"
+        - "managed-key-2"
+      header: "Authorization"
+      prefix: "Bearer"
+```
+
+**效果**：
+- 忽略请求中携带的任何Token
+- 强制使用池中当前Token
+
+### 示例5：不使用Token
+
+```yaml
+configs:
+  - name: "public-service"
     remote_url: "https://public-api.example.com"
-    # 不配置token字段，或enabled: false
+    # 不配置token字段即不启用Token管理
 ```
 
 **效果**：
@@ -143,9 +235,25 @@ timeout: 30
 routes:
   # API路由 - 使用3个Token轮换
   - path_pattern: "^/api/"
+    config: "api-service"
+
+  # 内部服务 - 使用2个API Key
+  - path_pattern: "^/internal/"
+    config: "internal-service"
+
+  # 公开路由 - 不使用Token
+  - path_pattern: "^/public/"
+    config: "public-service"
+
+  # 默认路由
+  - path_pattern: ".*"
+    config: "default-service"
+
+configs:
+  - name: "api-service"
     remote_url: "https://api-backend.example.com"
     token:
-      enabled: true
+      origin: "add"
       tokens:
         - "token-abc-123"
         - "token-def-456"
@@ -157,12 +265,11 @@ routes:
         action: "replace"
         pattern: "^/api/(.*)"
         value: "/v2/$1"
-  
-  # 内部服务 - 使用2个API Key
-  - path_pattern: "^/internal/"
+
+  - name: "internal-service"
     remote_url: "http://internal-service:3000"
     token:
-      enabled: true
+      origin: "add"
       tokens:
         - "internal-key-1"
         - "internal-key-2"
@@ -173,21 +280,19 @@ routes:
         action: "add"
         key: "X-Service"
         value: "proxy"
-  
-  # 公开路由 - 不使用Token
-  - path_pattern: "^/public/"
+
+  - name: "public-service"
     remote_url: "https://public-api.example.com"
     rules:
       - type: "header"
         action: "add"
         key: "X-Public"
         value: "true"
-  
-  # 默认路由 - 使用2个Token
-  - path_pattern: ".*"
+
+  - name: "default-service"
     remote_url: "https://api.example.com"
     token:
-      enabled: true
+      origin: "ignore"
       tokens:
         - "default-token-1"
         - "default-token-2"
@@ -259,15 +364,17 @@ type TokenManager struct {
     currentIndex int
     header       string
     prefix       string
+    origin       string // "use", "add", "ignore"
     failureCount int
 }
 ```
 
 **核心方法**：
 - `GetCurrentToken()`: 获取当前Token
-- `ApplyTokenToRequest()`: 应用Token到请求头
+- `ApplyTokenToRequest()`: 根据origin策略应用Token到请求头
 - `SwitchToNext()`: 切换到下一个Token
 - `RecordFailure()`: 记录失败
+- `GetOrigin()`: 获取origin策略
 
 ### 重试机制
 
@@ -303,7 +410,6 @@ for attempt := 0; attempt < maxRetries; attempt++ {
 
 ```yaml
 token:
-  enabled: true
   tokens:
     - "token-1"  # 100次/分钟
     - "token-2"  # 100次/分钟
@@ -316,7 +422,6 @@ token:
 
 ```yaml
 token:
-  enabled: true
   tokens:
     - "primary-token"     # 主Token
     - "backup-token-1"    # 备用Token 1
@@ -328,7 +433,6 @@ token:
 
 ```yaml
 token:
-  enabled: true
   tokens:
     - "user1-token"
     - "user2-token"
@@ -383,7 +487,6 @@ done
 
 ```yaml
 token:
-  enabled: true
   tokens:
     - "invalid-token-1"
     - "invalid-token-2"

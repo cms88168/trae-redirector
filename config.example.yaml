@@ -1,4 +1,7 @@
-# HTTP代理服务器 - 多路由配置示例
+# HTTP代理服务器 - 配置示例
+# 路径与详细配置分离：routes定义路径匹配和config引用，
+# configs定义详细配置（remote_url、rules、token等），通过name关联。
+# 所有配置统一在本文件中，无需额外目录。
 
 # 本地监听端口
 local_port: 8080
@@ -10,9 +13,24 @@ timeout: 30
 debug: false
 
 # 路由配置列表
+# 每个路由只需指定 path_pattern 和引用的 config 名称
+# 可通过Windows托盘菜单动态切换每个路由使用的config
 routes:
-  # 示例1: 用户服务路由
+  # 示例1: 匹配 /users/ 路径
   - path_pattern: "^/users/"
+    config: "user-service"
+
+  # 示例2: 匹配 /ai/ 路径（可在托盘中切换到 ai-backup）
+  - path_pattern: "^/ai/"
+    config: "ai-provider"
+
+  # 默认路由（可选）- 处理所有未匹配的请求
+  - path_pattern: ".*"
+    config: "default"
+
+# 详细配置列表（通过name区分）
+configs:
+  - name: "user-service"
     remote_url: "http://localhost:3001"
     rules:
       - type: "header"
@@ -23,32 +41,40 @@ routes:
         action: "replace"
         pattern: "^/users/(.*)"
         value: "/api/users/$1"
-  
-  # 示例2: 订单服务路由
-  - path_pattern: "^/orders/"
-    remote_url: "http://localhost:3002"
+
+  - name: "ai-provider"
+    remote_url: "https://api.openai.com/v1/chat/completions"
+    proxy:
+      type: "socks5"
+      address: "socks5://127.0.0.1:1080"
+    token:
+      origin: "add"       # use=只用请求原始Token, add(默认)=收集请求Token到池并用池Token替换, ignore=忽略请求Token只用池Token
+      tokens:
+        - "sk-xxx"
+        - "sk-yyy"
+      header: "Authorization"
+      prefix: "Bearer"
     rules:
-      - type: "header"
-        action: "add"
-        key: "X-Service"
-        value: "order-service"
-      - type: "query"
-        action: "add"
-        key: "source"
-        value: "proxy"
-  
-  # 示例3: 静态资源路由
-  - path_pattern: "^/static/"
-    remote_url: "http://localhost:8081"
+      - type: "body"
+        action: "json_add"
+        key: "model"
+        value: "gpt-4"
+
+  - name: "ai-backup"
+    remote_url: "https://api.deepseek.com/chat/completions"
+    token:
+      origin: "ignore"    # 忽略请求中的Token，只使用池中Token
+      tokens:
+        - "sk-backup-1"
+      header: "Authorization"
+      prefix: "Bearer"
     rules:
-      - type: "header"
-        action: "add"
-        key: "X-Cache"
-        value: "static"
-  
-  # 默认路由 - 可选配置，处理所有未匹配的请求
-  # 如果不配置默认路由，未匹配的请求将返回404
-  - path_pattern: ".*"
+      - type: "body"
+        action: "json_add"
+        key: "reasoning_effort"
+        value: "max"
+
+  - name: "default"
     remote_url: "http://localhost:3000"
     rules:
       - type: "header"

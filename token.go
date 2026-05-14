@@ -14,6 +14,7 @@ type TokenManager struct {
 	currentIndex int
 	header       string
 	prefix       string
+	origin       string // "use", "add", "ignore"
 	failureCount int
 }
 
@@ -29,15 +30,26 @@ func NewTokenManager(config *TokenConfig) *TokenManager {
 		prefix = "Bearer"
 	}
 
+	origin := config.Origin
+	if origin == "" {
+		origin = "add"
+	}
+
 	return &TokenManager{
 		tokens:       config.Tokens,
 		currentIndex: 0,
 		header:       header,
 		prefix:       prefix,
+		origin:       origin,
 	}
 }
 
-// GetCurrentToken 获取当前Token
+// GetOrigin 获取origin策略
+func (tm *TokenManager) GetOrigin() string {
+	return tm.origin
+}
+
+// GetCurrentToken 获取当前池中Token
 func (tm *TokenManager) GetCurrentToken() string {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
@@ -51,8 +63,37 @@ func (tm *TokenManager) GetCurrentIndex() int {
 	return tm.currentIndex
 }
 
-// ApplyTokenToRequest 应用Token到请求
+// ApplyTokenToRequest 根据origin策略处理请求的Token
+//
+// 这是 TokenManager 对外的唯一入口，整合了收集和应用逻辑：
+//   - "use": 透传 —— 不修改请求头，保留请求中原始Token
+//   - "add": 收集+替换 —— 将请求中的Token收集到池，然后用池中当前Token替换请求头
+//   - "ignore": 仅替换 —— 忽略请求中的Token，直接用池中当前Token替换请求头
 func (tm *TokenManager) ApplyTokenToRequest(req *http.Request) {
+	switch tm.origin {
+	case "use":
+		// 透传：不修改请求头
+		return
+
+	case "add":
+		// 先收集请求中的Token到池
+		tm.collectToken(req)
+		// 再用池中Token替换请求头
+		tm.setPoolToken(req)
+
+	case "ignore":
+		// 直接用池中Token替换请求头
+		tm.setPoolToken(req)
+
+	default:
+		// 未知值按add处理
+		tm.collectToken(req)
+		tm.setPoolToken(req)
+	}
+}
+
+// setPoolToken 将池中当前Token设置到请求头
+func (tm *TokenManager) setPoolToken(req *http.Request) {
 	token := tm.GetCurrentToken()
 	var authValue string
 	if tm.prefix != "" {
@@ -63,71 +104,52 @@ func (tm *TokenManager) ApplyTokenToRequest(req *http.Request) {
 	req.Header.Set(tm.header, authValue)
 }
 
-// SwitchToNext 切换到下一个Token
+// collectToken 从请求中提取Token，如果不在池中则添加
+func (tm *TokenManager) collectToken(req *http.Request) {
+	authHeader := req.Header.Get(tm.header)
+	if authHeader == "" {
+		return
+	}
+
+	// 提取纯token值（去掉prefix）
+	tokenValue := authHeader
+	if tm.prefix != "" && strings.HasPrefix(authHeader, tm.prefix+" ") {
+		tokenValue = strings.TrimPrefix(authHeader, tm.prefix+" ")
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	for _, t := range tm.tokens {
+		if t == tokenValue {
+			return // 已存在
+		}
+	}
+
+	log.Printf("[INFO] 收集新Token到池 (池大小: %d → %d)", len(tm.tokens), len(tm.tokens)+1)
+	tm.tokens = append(tm.tokens, tokenValue)
+}
+
+// SwitchToNext 切换到下一个Token（认证失败时调用）
 func (tm *TokenManager) SwitchToNext() string {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	tm.currentIndex = (tm.currentIndex + 1) % len(tm.tokens)
 	tm.failureCount = 0
-
 	return tm.tokens[tm.currentIndex]
 }
 
-// RecordFailure 记录失败
+// RecordFailure 记录认证失败
 func (tm *TokenManager) RecordFailure() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	tm.failureCount++
 }
 
-// GetFailureCount 获取失败次数
-func (tm *TokenManager) GetFailureCount() int {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	return tm.failureCount
-}
-
-// GetTokenCount 获取Token总数（不需要锁，因为tokens切片在创建后不会改变）
+// GetTokenCount 获取池中Token总数
 func (tm *TokenManager) GetTokenCount() int {
-	return len(tm.tokens)
-}
-
-// CheckAndAddToken 检查请求中的Token是否在池中，如果不在则添加
-func (tm *TokenManager) CheckAndAddToken(req *http.Request) {
-	// 从请求中提取Token
-	tokenValue := tm.extractTokenFromRequest(req)
-	if tokenValue == "" {
-		return // 没有Token头，不处理
-	}
-
-	// 检查Token是否已在池中
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-
-	for _, token := range tm.tokens {
-		if token == tokenValue {
-			// Token已在池中
-			return
-		}
-	}
-
-	// Token不在池中，添加到池
-	log.Printf("[WARN] 发现新的Token，正在添加到Token池 (当前池大小: %d)", len(tm.tokens))
-	tm.tokens = append(tm.tokens, tokenValue)
-	log.Printf("[INFO] Token已添加到池，新池大小: %d", len(tm.tokens))
-}
-
-// extractTokenFromRequest 从请求中提取Token值（内部方法）
-func (tm *TokenManager) extractTokenFromRequest(req *http.Request) string {
-	authHeader := req.Header.Get(tm.header)
-	if authHeader == "" {
-		return ""
-	}
-
-	if tm.prefix != "" && strings.HasPrefix(authHeader, tm.prefix+" ") {
-		return strings.TrimPrefix(authHeader, tm.prefix+" ")
-	}
-
-	return authHeader
+	return len(tm.tokens)
 }

@@ -16,9 +16,12 @@ import (
 
 // Proxy 代理服务器
 type Proxy struct {
+	configMu      sync.RWMutex
 	config        *Config
 	tokenMu       sync.RWMutex
 	tokenManagers map[string]*TokenManager
+	clientMu      sync.RWMutex
+	httpClients   map[string]*http.Client // 按路由缓存的HTTP客户端
 }
 
 // NewProxy 创建代理服务器实例
@@ -26,7 +29,33 @@ func NewProxy(config *Config) *Proxy {
 	return &Proxy{
 		config:        config,
 		tokenManagers: make(map[string]*TokenManager),
+		httpClients:   make(map[string]*http.Client),
 	}
+}
+
+// ReloadConfig 热重载配置（线程安全）
+func (p *Proxy) ReloadConfig(newConfig *Config) {
+	p.configMu.Lock()
+	p.config = newConfig
+	p.configMu.Unlock()
+
+	// 清空缓存，下次请求时重新创建
+	p.tokenMu.Lock()
+	p.tokenManagers = make(map[string]*TokenManager)
+	p.tokenMu.Unlock()
+
+	p.clientMu.Lock()
+	p.httpClients = make(map[string]*http.Client)
+	p.clientMu.Unlock()
+
+	log.Printf("代理配置已重载，路由数: %d", len(newConfig.Routes))
+}
+
+// getConfig 获取当前配置（线程安全读取）
+func (p *Proxy) getConfig() *Config {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
+	return p.config
 }
 
 // createHTTPClient 创建HTTP客户端，支持代理配置
@@ -63,18 +92,19 @@ func createHTTPClient(timeout int, proxyConfig *ProxyConfig) (*http.Client, erro
 
 // Start 启动代理服务器
 func (p *Proxy) Start() error {
-	addr := fmt.Sprintf(":%d", p.config.LocalPort)
+	config := p.getConfig()
+	addr := fmt.Sprintf(":%d", config.LocalPort)
 
 	log.Printf("代理服务器启动在 http://localhost%s", addr)
-	log.Printf("配置路由数: %d", len(p.config.Routes))
-	for i, route := range p.config.Routes {
+	log.Printf("配置路由数: %d", len(config.Routes))
+	for i, route := range config.Routes {
 		tokenInfo := ""
-		if route.Token != nil && route.Token.Enabled {
+		if route.Token != nil && len(route.Token.Tokens) > 0 {
 			tokenInfo = fmt.Sprintf(" (%d个Token)", len(route.Token.Tokens))
 		}
 		log.Printf("路由 %d: %s -> %s (%d条规则)%s", i+1, route.PathPattern, route.RemoteURL, len(route.Rules), tokenInfo)
 	}
-	log.Printf("超时设置: %d秒", p.config.Timeout)
+	log.Printf("超时设置: %d秒", config.Timeout)
 
 	// 创建HTTP服务器
 	// 注意：为适配流式响应（SSE/chunked），不设置 ReadTimeout/WriteTimeout；
@@ -96,11 +126,10 @@ func (p *Proxy) Start() error {
 
 // getTokenManager 获取路由的Token管理器
 func (p *Proxy) getTokenManager(route *Route) *TokenManager {
-	if route.Token == nil || !route.Token.Enabled {
+	if route.Token == nil || len(route.Token.Tokens) == 0 {
 		return nil
 	}
 
-	// 从缓存获取或创建
 	p.tokenMu.Lock()
 	defer p.tokenMu.Unlock()
 
@@ -114,6 +143,29 @@ func (p *Proxy) getTokenManager(route *Route) *TokenManager {
 	return manager
 }
 
+// getHTTPClient 获取路由的HTTP客户端（按路由缓存，复用连接池）
+func (p *Proxy) getHTTPClient(route *Route, timeout int) (*http.Client, error) {
+	p.clientMu.RLock()
+	key := route.PathPattern
+	if client, exists := p.httpClients[key]; exists {
+		p.clientMu.RUnlock()
+		return client, nil
+	}
+	p.clientMu.RUnlock()
+
+	// 创建新客户端
+	client, err := createHTTPClient(timeout, route.Proxy)
+	if err != nil {
+		return nil, err
+	}
+
+	p.clientMu.Lock()
+	p.httpClients[key] = client
+	p.clientMu.Unlock()
+
+	return client, nil
+}
+
 // cloneRequest 克隆请求（用于重试）
 func cloneRequest(r *http.Request, bodyBytes []byte) *http.Request {
 	newReq := r.Clone(r.Context())
@@ -125,15 +177,16 @@ func cloneRequest(r *http.Request, bodyBytes []byte) *http.Request {
 
 // serveHTTP 处理HTTP请求（流程编排）
 func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	config := p.getConfig()
 	log.Printf("收到请求: %s %s", r.Method, r.URL.String())
 
 	// Debug模式：打印请求详细信息
-	if p.config.Debug {
+	if config.Debug {
 		p.logRequestDetails(r)
 	}
 
 	// 1. 匹配路由
-	matchedRoute, err := p.matchRoute(r.URL.Path)
+	matchedRoute, err := p.matchRoute(config, r.URL.Path)
 	if err != nil {
 		p.handleRouteNotFoundError(w, err)
 		return
@@ -149,12 +202,12 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Debug模式：打印请求体
-	if p.config.Debug && len(bodyBytes) > 0 {
+	if config.Debug && len(bodyBytes) > 0 {
 		log.Printf("[DEBUG] 请求体:\n%s", string(bodyBytes))
 	}
 
 	// 3. 执行请求（带重试）
-	resp, err := p.executeWithRetry(r, matchedRoute, bodyBytes)
+	resp, err := p.executeWithRetry(r, matchedRoute, bodyBytes, config)
 	if err != nil {
 		p.handleRequestError(w, err)
 		return
@@ -162,7 +215,7 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	// 4. 返回响应
-	p.forwardResponse(w, r, resp)
+	p.forwardResponse(w, r, resp, config)
 }
 
 // logRequestDetails 打印请求的详细信息（Debug模式）
@@ -196,8 +249,8 @@ func (p *Proxy) logRequestDetails(r *http.Request) {
 }
 
 // matchRoute 匹配路由
-func (p *Proxy) matchRoute(path string) (*Route, error) {
-	return MatchRoute(p.config.Routes, path)
+func (p *Proxy) matchRoute(config *Config, path string) (*Route, error) {
+	return MatchRoute(config.Routes, path)
 }
 
 // readRequestBody 读取请求体
@@ -209,12 +262,12 @@ func (p *Proxy) readRequestBody(r *http.Request) ([]byte, error) {
 }
 
 // executeWithRetry 执行请求（带Token重试）
-func (p *Proxy) executeWithRetry(r *http.Request, route *Route, bodyBytes []byte) (*http.Response, error) {
+func (p *Proxy) executeWithRetry(r *http.Request, route *Route, bodyBytes []byte, config *Config) (*http.Response, error) {
 	tokenManager := p.getTokenManager(route)
 	maxRetries := p.getRetryCount(tokenManager)
 
 	if tokenManager != nil {
-		log.Printf("Token轮换已启用，Token数量: %d", maxRetries)
+		log.Printf("Token轮换已启用，Token数量: %d，origin: %s", maxRetries, tokenManager.GetOrigin())
 	}
 
 	var lastErr error
@@ -224,14 +277,14 @@ func (p *Proxy) executeWithRetry(r *http.Request, route *Route, bodyBytes []byte
 			log.Printf("使用Token索引: %d", tokenManager.GetCurrentIndex())
 		}
 
-		resp, err := p.attemptRequest(r, route, bodyBytes, tokenManager, attempt)
+		resp, err := p.attemptRequest(r, route, bodyBytes, tokenManager, attempt, maxRetries, config)
 		if err == nil {
 			return resp, nil
 		}
 
 		lastErr = err
 
-		// 如枟是认证失败且有Token管理器，继续重试
+		// 如果是认证失败且有Token管理器，继续重试
 		if !p.isAuthError(err) || tokenManager == nil {
 			break
 		}
@@ -245,7 +298,7 @@ func (p *Proxy) executeWithRetry(r *http.Request, route *Route, bodyBytes []byte
 
 // attemptRequest 尝试单次请求
 func (p *Proxy) attemptRequest(r *http.Request, route *Route, bodyBytes []byte,
-	tokenManager *TokenManager, attempt int) (*http.Response, error) {
+	tokenManager *TokenManager, attempt int, maxRetries int, config *Config) (*http.Response, error) {
 
 	// 1. 克隆请求
 	retryReq := cloneRequest(r, bodyBytes)
@@ -262,31 +315,26 @@ func (p *Proxy) attemptRequest(r *http.Request, route *Route, bodyBytes []byte,
 	// 获取处理后的请求体
 	modifiedBody := handler.GetBody()
 
-	// 2.5 如果启用了Token管理，检查并添加请求中的新Token
-	if tokenManager != nil {
-		tokenManager.CheckAndAddToken(retryReq)
-	}
-
 	// 3. 构建远程URL
 	remoteURL, err := BuildRemoteURL(route.RemoteURL, retryReq)
 	if err != nil {
 		return nil, fmt.Errorf("构建远程URL失败: %w", err)
 	}
 
-	// 4. 创建客户端
-	client, err := createHTTPClient(p.config.Timeout, route.Proxy)
+	// 4. 获取HTTP客户端（按路由缓存，复用连接池）
+	client, err := p.getHTTPClient(route, config.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("创建HTTP客户端失败: %w", err)
 	}
 
-	// 5. 创建远程请求
+	// 5. 创建远程请求（内部会调用 tokenManager.ApplyTokenToRequest 处理Token）
 	remoteReq, err := p.createRemoteRequest(r, retryReq, remoteURL, tokenManager, handler)
 	if err != nil {
 		return nil, err
 	}
 
 	// Debug模式：打印处理后的远程请求信息
-	if p.config.Debug {
+	if config.Debug {
 		log.Printf("[DEBUG] ===== 处理后远程请求 =====")
 		log.Printf("[DEBUG] 远程URL: %s", remoteURL)
 		log.Printf("[DEBUG] 方法: %s", remoteReq.Method)
@@ -302,7 +350,7 @@ func (p *Proxy) attemptRequest(r *http.Request, route *Route, bodyBytes []byte,
 		log.Printf("[DEBUG] ================================")
 	}
 
-	log.Printf("转发到: %s (尝试 %d/%d)", remoteURL, attempt+1, p.getRetryCount(tokenManager))
+	log.Printf("转发到: %s (尝试 %d/%d)", remoteURL, attempt+1, maxRetries)
 
 	// 6. 发送请求
 	resp, err := client.Do(remoteReq)
@@ -365,9 +413,8 @@ func (p *Proxy) handleRequestError(w http.ResponseWriter, err error) {
 	http.Error(w, "远程请求失败", http.StatusBadGateway)
 }
 
-// forwardResponse 转发响应
-func (p *Proxy) forwardResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) {
-	defer resp.Body.Close()
+// forwardResponse 转发响应（调用方负责关闭resp.Body）
+func (p *Proxy) forwardResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, config *Config) {
 	log.Printf("收到响应: %d %s", resp.StatusCode, resp.Status)
 
 	for key, values := range resp.Header {
@@ -382,7 +429,7 @@ func (p *Proxy) forwardResponse(w http.ResponseWriter, r *http.Request, resp *ht
 		w.Header().Del("Content-Length")
 	}
 
-	if p.config.Debug {
+	if config.Debug {
 		log.Printf("[DEBUG] ===== 响应头 =====")
 		for key, values := range resp.Header {
 			for _, value := range values {
