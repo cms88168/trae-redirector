@@ -147,7 +147,7 @@ func openConsoleOutput() *os.File {
 	return os.NewFile(handle, "CONOUT$")
 }
 
-// openLogFile 使用系统默认程序打开日志文件
+// openLogFile 使用类似tail的命令实时查看日志文件
 func openLogFile() {
 	logMu.Lock()
 	defer logMu.Unlock()
@@ -155,8 +155,45 @@ func openLogFile() {
 	if logFilePath == "" {
 		return
 	}
-	cmd := exec.Command("notepad.exe", logFilePath)
-	_ = cmd.Start()
+
+	// 检查日志文件是否存在
+	if _, err := os.Stat(logFilePath); os.IsNotExist(err) {
+		log.Printf("日志文件不存在: %s", logFilePath)
+		return
+	}
+
+	// 构建PowerShell内联命令
+	// 使用Get-Content -Wait -Tail实时监控日志，UTF-8编码读取
+	powershellCmd := fmt.Sprintf(
+		"$host.UI.RawUI.WindowTitle='Trae Redirector 日志监控'; "+
+			"[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "+
+			"$OutputEncoding=[System.Text.Encoding]::UTF8; "+
+			"$sep='=' * 40; "+
+			"Write-Host $sep -ForegroundColor Cyan; "+
+			"Write-Host '  Trae Redirector 日志监控' -ForegroundColor Cyan; "+
+			"Write-Host $sep -ForegroundColor Cyan; "+
+			"Write-Host ''; "+
+			"Write-Host '日志文件: ' -NoNewline -ForegroundColor Green; "+
+			"Write-Host '%s' -ForegroundColor White; "+
+			"Write-Host '显示最后50行，实时监控新日志' -ForegroundColor Yellow; "+
+			"Write-Host '按 Ctrl+C 停止监控' -ForegroundColor Yellow; "+
+			"Write-Host $sep -ForegroundColor Cyan; "+
+			"Write-Host ''; "+
+			"Get-Content -Path '%s' -Wait -Tail 50 -Encoding UTF8",
+		logFilePath, logFilePath,
+	)
+
+	// 使用CmdLine和SysProcAttr确保命令正确传递
+	cmdLine := fmt.Sprintf(`/C start "日志监控" powershell -NoExit -Command "%s"`, powershellCmd)
+
+	cmd := exec.Command("cmd")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CmdLine: cmdLine,
+	}
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("打开日志文件失败: %v", err)
+	}
 }
 
 // --- 系统托盘 ---
@@ -186,7 +223,7 @@ func onTrayReady() {
 	systray.SetTitle("")
 	systray.SetTooltip("Trae Redirector - HTTP 代理")
 
-	mOpenLog := systray.AddMenuItem("打开日志", "使用记事本打开日志文件")
+	mOpenLog := systray.AddMenuItem("打开日志", "使用tail模式实时查看日志文件")
 	systray.AddSeparator()
 
 	// 添加路由配置切换菜单
