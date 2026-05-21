@@ -24,10 +24,14 @@ var (
 	procAttachConsole = modKernel32.NewProc("AttachConsole")
 	procCreateFileW   = modKernel32.NewProc("CreateFileW")
 	procSetStdHandle  = modKernel32.NewProc("SetStdHandle")
+	modUser32         = syscall.NewLazyDLL("user32.dll")
+	procFindWindowW   = modUser32.NewProc("FindWindowW")
+	procSendMessageW  = modUser32.NewProc("SendMessageW")
 )
 
 const (
 	attachParentProcess uint32 = ^uint32(0) // ATTACH_PARENT_PROCESS = (DWORD)-1
+	WM_CLOSE                   = 0x0010     // Windows消息：关闭窗口
 )
 
 // stdOutputHandle/stdErrorHandle 用补码表示负数常量
@@ -162,6 +166,12 @@ func openLogFile() {
 		return
 	}
 
+	// 如果已有日志窗口，不再打开
+	if isLogViewerOpen() {
+		log.Printf("日志监控窗口已打开")
+		return
+	}
+
 	// 构建PowerShell内联命令
 	// 使用Get-Content -Wait -Tail实时监控日志，UTF-8编码读取
 	powershellCmd := fmt.Sprintf(
@@ -183,8 +193,7 @@ func openLogFile() {
 		logFilePath, logFilePath,
 	)
 
-	// 使用CmdLine和SysProcAttr确保命令正确传递
-	cmdLine := fmt.Sprintf(`/C start "日志监控" powershell -NoExit -Command "%s"`, powershellCmd)
+	cmdLine := fmt.Sprintf(`/C start "Trae Redirector 日志监控" powershell -NoExit -Command "%s"`, powershellCmd)
 
 	cmd := exec.Command("cmd")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -194,6 +203,44 @@ func openLogFile() {
 	if err := cmd.Start(); err != nil {
 		log.Printf("打开日志文件失败: %v", err)
 	}
+}
+
+// findWindowByTitle 通过窗口标题查找窗口句柄
+func findWindowByTitle(title string) uintptr {
+	windowTitle, _ := syscall.UTF16PtrFromString(title)
+
+	// 只使用窗口标题查找，不指定类名（第一个参数为0）
+	hwnd, _, _ := procFindWindowW.Call(
+		0,
+		uintptr(unsafe.Pointer(windowTitle)),
+	)
+
+	return hwnd
+}
+
+// closeLogViewer 关闭日志查看器窗口
+// 返回是否找到了窗口并关闭
+func closeLogViewer() bool {
+	hwnd := findWindowByTitle("Trae Redirector 日志监控")
+
+	if hwnd != 0 {
+		log.Printf("正在关闭日志监控窗口...")
+		// 发送WM_CLOSE消息关闭窗口
+		procSendMessageW.Call(
+			hwnd,
+			WM_CLOSE,
+			0,
+			0,
+		)
+		return true
+	}
+	return false
+}
+
+// isLogViewerOpen 检查日志查看器窗口是否已打开
+func isLogViewerOpen() bool {
+	hwnd := findWindowByTitle("Trae Redirector 日志监控")
+	return hwnd != 0
 }
 
 // --- 系统托盘 ---
@@ -212,6 +259,11 @@ func runTray(proxy *Proxy, configManager *ConfigManager, onExitFn func()) {
 	trayConfigManager = configManager
 
 	systray.Run(onTrayReady, func() {
+		// 关闭日志监控窗口（如果已打开）
+		if closeLogViewer() {
+			log.Printf("日志监控窗口已关闭")
+		}
+
 		if onExitFn != nil {
 			onExitFn()
 		}
